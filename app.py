@@ -108,8 +108,11 @@ def styled(fig):
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="#D7DBE2", family="Inter"),
         title_font=dict(color="#F3F4F6", size=16),
-        legend=dict(bgcolor="rgba(0,0,0,0)"),
-        margin=dict(l=10, r=10, t=50, b=10),
+        legend=dict(bgcolor="rgba(0,0,0,0)", orientation="h",
+                    yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=54, b=10),
+        hoverlabel=dict(bgcolor="#161B26", bordercolor="#2a3242",
+                        font=dict(color="#E8EAED", family="Inter")),
     )
     fig.update_xaxes(gridcolor="#1e2430", zerolinecolor="#1e2430")
     fig.update_yaxes(gridcolor="#1e2430", zerolinecolor="#1e2430")
@@ -118,6 +121,35 @@ def styled(fig):
 
 def fmt(n, suffix=""):
     return f"{n:,.0f}".replace(",", " ") + suffix
+
+
+def vbar_labeled(df, x, y, title, ylab, color):
+    # вертикальный бар с цифрами над столбцами
+    fig = px.bar(df, x=x, y=y, title=title, labels={y: ylab, x: "дата"},
+                 text=y, color_discrete_sequence=[color])
+    fig.update_traces(textposition="outside", cliponaxis=False,
+                      texttemplate="<b>%{text}</b>",
+                      textfont=dict(color="#F3F4F6", size=13, family="Inter"),
+                      marker_cornerradius=7, marker_line_width=0,
+                      hovertemplate="%{x|%d.%m}<br>%{y} шт<extra></extra>")
+    mx = float(df[y].max()) if len(df) else 0
+    fig.update_yaxes(range=[0, mx * 1.22], showticklabels=False)
+    return styled(fig)
+
+
+def hbar(df, valcol, namecol, title, color, suffix=" ₽"):
+    # горизонтальный бар с подписями значений у концов столбцов
+    fig = px.bar(df, x=valcol, y=namecol, orientation="h", title=title,
+                 color_discrete_sequence=[color])
+    fig.update_traces(text=[fmt(v) + suffix for v in df[valcol]],
+                      textposition="outside", cliponaxis=False,
+                      textfont=dict(color="#cdd2db", size=11, family="Inter"),
+                      marker_cornerradius=6, marker_line_width=0,
+                      hovertemplate="%{y}<br>%{x:,.0f}<extra></extra>")
+    mx = float(df[valcol].max()) if len(df) else 0
+    fig.update_xaxes(range=[0, mx * 1.20], showgrid=False, showticklabels=False)
+    fig.update_yaxes(categoryorder="total ascending")
+    return styled(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -375,15 +407,19 @@ with tabs[0]:
         else:
             merged = od.assign(выкуплено=0)
 
-        st.plotly_chart(styled(px.line(
-            merged, x="date", y=["сумма", "выкуплено"], markers=True,
-            title="Динамика: заказы vs выкупы, ₽",
-            labels={"value": "₽", "variable": "", "date": "дата"},
-            color_discrete_sequence=PALETTE)), use_container_width=True)
-        st.plotly_chart(styled(px.bar(
-            od, x="date", y="заказов", title="Количество заказов по дням, шт",
-            labels={"заказов": "шт", "date": "дата"},
-            color_discrete_sequence=[ACCENT])), use_container_width=True)
+        figd = px.line(merged, x="date", y=["сумма", "выкуплено"], markers=True,
+                       title="Динамика: заказы vs выкупы, ₽",
+                       labels={"value": "₽", "variable": "", "date": "дата"},
+                       color_discrete_sequence=PALETTE)
+        figd.update_traces(line_shape="spline", line_width=3, marker=dict(size=7))
+        figd.update_traces(selector=dict(name="сумма"), fill="tozeroy",
+                           fillcolor="rgba(212,175,55,0.12)")
+        figd.update_layout(hovermode="x unified")
+        st.plotly_chart(styled(figd), use_container_width=True)
+
+        st.plotly_chart(vbar_labeled(od, "date", "заказов",
+                        "Количество заказов по дням, шт", "шт", ACCENT),
+                        use_container_width=True)
 
 # ===========================================================================
 # Заказы
@@ -395,22 +431,19 @@ with tabs[1]:
         o = orders.copy()
         c1, c2 = st.columns(2)
         if "subject" in o:
-            top = o.groupby("subject")[o_amt].sum().sort_values(ascending=False).head(15).reset_index()
-            c1.plotly_chart(styled(px.bar(top, x=o_amt, y="subject", orientation="h",
-                            title="Топ категорий по сумме, ₽",
-                            color_discrete_sequence=[ACCENT])), use_container_width=True)
+            top = o.groupby("subject")[o_amt].sum().sort_values(ascending=False).head(12).reset_index()
+            c1.plotly_chart(hbar(top, o_amt, "subject", "Топ категорий по сумме, ₽", ACCENT),
+                            use_container_width=True)
         if "brand" in o:
-            tb = o.groupby("brand")[o_amt].sum().sort_values(ascending=False).head(15).reset_index()
-            c2.plotly_chart(styled(px.bar(tb, x=o_amt, y="brand", orientation="h",
-                            title="Топ брендов по сумме, ₽",
-                            color_discrete_sequence=[ACCENT2])), use_container_width=True)
+            tb = o.groupby("brand")[o_amt].sum().sort_values(ascending=False).head(12).reset_index()
+            c2.plotly_chart(hbar(tb, o_amt, "brand", "Топ брендов по сумме, ₽", ACCENT2),
+                            use_container_width=True)
         region_col = "oblastOkrugName" if "oblastOkrugName" in o else (
             "regionName" if "regionName" in o else None)
         if region_col:
-            reg = o.groupby(region_col)[o_amt].sum().sort_values(ascending=False).head(15).reset_index()
-            st.plotly_chart(styled(px.bar(reg, x=o_amt, y=region_col, orientation="h",
-                            title="География заказов по сумме, ₽",
-                            color_discrete_sequence=PALETTE)), use_container_width=True)
+            reg = o.groupby(region_col)[o_amt].sum().sort_values(ascending=False).head(12).reset_index()
+            st.plotly_chart(hbar(reg, o_amt, region_col, "География заказов по сумме, ₽", "#5AD1A5"),
+                            use_container_width=True)
         st.dataframe(o, use_container_width=True, height=320)
 
 # ===========================================================================
@@ -429,15 +462,16 @@ with tabs[2]:
         if not b.empty:
             b["date"] = pd.to_datetime(b["date"]).dt.date
             bd = b.groupby("date")["forPay"].sum().reset_index()
-            st.plotly_chart(styled(px.area(bd, x="date", y="forPay",
-                            title="Выкупы по дням (к перечислению), ₽",
-                            labels={"forPay": "₽", "date": "дата"},
-                            color_discrete_sequence=[ACCENT])), use_container_width=True)
+            figb = px.area(bd, x="date", y="forPay", title="Выкупы по дням (к перечислению), ₽",
+                           labels={"forPay": "₽", "date": "дата"}, color_discrete_sequence=[ACCENT])
+            figb.update_traces(line_shape="spline", line_width=2.5,
+                               fillcolor="rgba(212,175,55,0.15)",
+                               hovertemplate="%{x|%d.%m}<br>%{y:,.0f} ₽<extra></extra>")
+            st.plotly_chart(styled(figb), use_container_width=True)
             if "warehouseName" in b:
-                wh = b.groupby("warehouseName")["forPay"].sum().sort_values(ascending=False).head(15).reset_index()
-                st.plotly_chart(styled(px.bar(wh, x="forPay", y="warehouseName", orientation="h",
-                                title="Выкупы по складам, ₽",
-                                color_discrete_sequence=[ACCENT2])), use_container_width=True)
+                wh = b.groupby("warehouseName")["forPay"].sum().sort_values(ascending=False).head(12).reset_index()
+                st.plotly_chart(hbar(wh, "forPay", "warehouseName", "Выкупы по складам, ₽", ACCENT2),
+                                use_container_width=True)
         st.dataframe(sales, use_container_width=True, height=320)
 
 # ===========================================================================
@@ -503,14 +537,12 @@ with tabs[4]:
             c2.metric("В пути к клиенту", fmt(int(sdf["inWayToClient"].sum())))
         if "warehouseName" in sdf and qty in sdf:
             wh = sdf.groupby("warehouseName")[qty].sum().sort_values(ascending=False).reset_index()
-            st.plotly_chart(styled(px.bar(wh, x=qty, y="warehouseName", orientation="h",
-                            title="Остатки по складам, шт",
-                            color_discrete_sequence=[ACCENT])), use_container_width=True)
+            st.plotly_chart(hbar(wh, qty, "warehouseName", "Остатки по складам, шт", ACCENT, suffix=" шт"),
+                            use_container_width=True)
         if "subject" in sdf and qty in sdf:
             sub = sdf.groupby("subject")[qty].sum().sort_values(ascending=False).head(15).reset_index()
-            st.plotly_chart(styled(px.bar(sub, x=qty, y="subject", orientation="h",
-                            title="Остатки по категориям, шт",
-                            color_discrete_sequence=[ACCENT2])), use_container_width=True)
+            st.plotly_chart(hbar(sub, qty, "subject", "Остатки по категориям, шт", ACCENT2, suffix=" шт"),
+                            use_container_width=True)
         # Детализация: товар x склад
         if "warehouseName" in sdf and qty in sdf:
             pcol = "supplierArticle" if "supplierArticle" in sdf else (
