@@ -635,11 +635,24 @@ try:
             grp = grp[(grp["Штраф"] != 0) | (grp["Доплата"] != 0)]
             grp = grp.sort_values("Штраф", ascending=False)
             grp.columns = ["За что", "Штраф, ₽", "Доплата/компенсация, ₽"]
-            st.markdown("**За что начислено — расшифровка:**")
+            st.markdown("**За что начислено — сводно:**")
             if grp.empty:
                 st.caption("Штрафов и доплат за период нет 🎉")
             else:
-                st.dataframe(grp, use_container_width=True, hide_index=True, height=320)
+                st.dataframe(grp, use_container_width=True, hide_index=True, height=300)
+
+                # детально: дата, товар, артикул, за что, суммы
+                det = repdf[(repdf["penalty"] != 0) | (repdf["additional_payment"] != 0)].copy()
+                date_col = next((c for c in ("rr_dt", "order_dt", "sale_dt") if c in det.columns), None)
+                det["Дата"] = (pd.to_datetime(det[date_col], errors="coerce").dt.strftime("%d.%m.%Y")
+                               if date_col else "—")
+                det["Товар"] = det["sa_name"] if "sa_name" in det.columns else "—"
+                det["Артикул WB"] = det["nm_id"] if "nm_id" in det.columns else ""
+                det = det[["Дата", "Товар", "Артикул WB", rcol, "penalty", "additional_payment"]]
+                det.columns = ["Дата", "Товар", "Артикул WB", "За что", "Штраф, ₽", "Доплата, ₽"]
+                det = det.sort_values("Дата")
+                st.markdown("**Детально — дата и товар по каждому штрафу/доплате:**")
+                st.dataframe(det, use_container_width=True, hide_index=True, height=380)
         else:
             st.caption("В отчёте нет поля обоснования.")
 except requests.HTTPError as e:
