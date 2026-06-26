@@ -482,7 +482,31 @@ with tabs[4]:
             st.plotly_chart(styled(px.bar(sub, x=qty, y="subject", orientation="h",
                             title="Остатки по категориям, шт",
                             color_discrete_sequence=[ACCENT2])), use_container_width=True)
-        st.dataframe(sdf, use_container_width=True, height=320)
+        # Детализация: товар x склад
+        if "warehouseName" in sdf and qty in sdf:
+            pcol = "supplierArticle" if "supplierArticle" in sdf else (
+                "nmId" if "nmId" in sdf else "subject")
+
+            st.markdown("#### 📦 Остатки: товар × склад")
+            pivot = (sdf.groupby([pcol, "warehouseName"])[qty].sum().reset_index()
+                     .pivot(index=pcol, columns="warehouseName", values=qty)
+                     .fillna(0).astype(int))
+            pivot["Итого"] = pivot.sum(axis=1)
+            pivot = pivot.sort_values("Итого", ascending=False)
+            pivot.index.name = "Товар"
+            st.dataframe(pivot, use_container_width=True, height=380)
+
+            st.markdown("#### 🏬 Остатки по каждому складу")
+            wh_order = sdf.groupby("warehouseName")[qty].sum().sort_values(ascending=False)
+            for whname, total in wh_order.items():
+                with st.expander(f"{whname} — {fmt(int(total))} шт"):
+                    detail = (sdf[sdf["warehouseName"] == whname]
+                              .groupby(pcol)[qty].sum().sort_values(ascending=False).reset_index())
+                    detail.columns = ["Товар", "Остаток, шт"]
+                    st.dataframe(detail, use_container_width=True, height=260, hide_index=True)
+
+        with st.expander("Полная таблица остатков (все поля WB)"):
+            st.dataframe(sdf, use_container_width=True, height=320)
 
 # ===========================================================================
 # История
