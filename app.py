@@ -328,6 +328,7 @@ with tabs[2]:
         b = buyouts.copy()
         if not b.empty:
             b["date"] = pd.to_datetime(b["date"]).dt.date
+            bd = b.groupby("date")["forPay"].sum().reset_index()
             st.plotly_chart(styled(px.area(bd, x="date", y="forPay",
                             title="Выкупы по дням (к перечислению), ₽",
                             labels={"forPay": "₽", "date": "дата"},
