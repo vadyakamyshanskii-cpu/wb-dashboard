@@ -236,3 +236,57 @@ def today_iso() -> str:
 
 def days_ago_iso(days: int) -> str:
     return (dt.date.today() - dt.timedelta(days=days)).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Feedbacks API — отзывы (нужен токен с доступом «Вопросы и отзывы»)
+# ---------------------------------------------------------------------------
+FEEDBACKS_BASE = "https://feedbacks-api.wildberries.ru"
+
+
+def get_feedbacks(since_iso: str) -> pd.DataFrame:
+    """Отзывы, созданные не раньше since_iso (YYYY-MM-DD).
+    Возвращает DataFrame[createdDate, valuation]. Тянет отвеченные и неотвеченные
+    постранично (order=dateDesc) и останавливается, пройдя since_iso."""
+    rows = []
+    for answered in ("true", "false"):
+        skip = 0
+        while True:
+            r = requests.get(
+                FEEDBACKS_BASE + "/api/v1/feedbacks",
+                headers=_headers(),
+                params={"isAnswered": answered, "take": 5000, "skip": skip, "order": "dateDesc"},
+                timeout=TIMEOUT,
+            )
+            r.raise_for_status()
+            fbs = ((r.json() or {}).get("data") or {}).get("feedbacks") or []
+            if not fbs:
+                break
+            stop = False
+            for f in fbs:
+                cd = (f.get("createdDate") or "")[:10]
+                rows.append({"createdDate": cd, "valuation": f.get("productValuation")})
+                if cd and cd < since_iso:
+                    stop = True
+            if stop or len(fbs) < 5000:
+                break
+            skip += 5000
+            if skip >= 200000:
+                break
+    return pd.DataFrame(rows)
+
+
+def classify_feedbacks(df, a, b) -> dict:
+    """Хорошие (4-5★) и плохие (1-3★) отзывы в диапазоне дат [a, b]."""
+    empty = {"total": 0, "good": 0, "bad": 0, "avg": 0.0}
+    if df is None or df.empty or "createdDate" not in df.columns:
+        return empty
+    d = pd.to_datetime(df["createdDate"], errors="coerce").dt.date
+    sub = df[(d >= a) & (d <= b)]
+    val = pd.to_numeric(sub["valuation"], errors="coerce")
+    return {
+        "total": int(len(sub)),
+        "good": int((val >= 4).sum()),
+        "bad": int((val <= 3).sum()),
+        "avg": float(val.mean()) if val.notna().any() else 0.0,
+    }

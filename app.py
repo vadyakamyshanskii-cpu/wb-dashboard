@@ -148,6 +148,11 @@ def c_ad_stats(ids, begin, end):
     return wb.get_advert_fullstats(list(ids), begin, end)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def c_feedbacks(since_iso):
+    return wb.get_feedbacks(since_iso)
+
+
 # ---------------------------------------------------------------------------
 # Шапка + проверка токена
 # ---------------------------------------------------------------------------
@@ -296,6 +301,30 @@ r2[0].metric("% выкупа", fmt(kpis["buyout_rate"], " %"), dpct(kpis["buyout
 r2[1].metric("Средний чек, ₽", fmt(kpis["avg_check"]), dpct(kpis["avg_check"], prev_kpis["avg_check"]))
 r2[2].metric("Отмен, шт", fmt(kpis["cancels_cnt"]), dpct(kpis["cancels_cnt"], prev_kpis["cancels_cnt"]), delta_color="inverse")
 r2[3].metric("Возвратов, шт", fmt(kpis["returns_cnt"]), dpct(kpis["returns_cnt"], prev_kpis["returns_cnt"]), delta_color="inverse")
+
+# ---------------------------------------------------------------------------
+# Отзывы (нужен токен с доступом «Вопросы и отзывы»)
+# ---------------------------------------------------------------------------
+st.write("")
+st.markdown("#### 💬 Отзывы за период")
+try:
+    fb_raw = c_feedbacks(prev_start.isoformat())
+    rev = wb.classify_feedbacks(fb_raw, start_d, end_d)
+    rev_prev = wb.classify_feedbacks(fb_raw, prev_start, prev_end)
+    rr = st.columns(4)
+    rr[0].metric("Отзывов всего", fmt(rev["total"]), dpct(rev["total"], rev_prev["total"]))
+    rr[1].metric("👍 Хороших (4–5★)", fmt(rev["good"]), dpct(rev["good"], rev_prev["good"]))
+    rr[2].metric("👎 Плохих (1–3★)", fmt(rev["bad"]), dpct(rev["bad"], rev_prev["bad"]), delta_color="inverse")
+    rr[3].metric("Средняя оценка", f"{rev['avg']:.2f} ★" if rev["avg"] else "—")
+except requests.HTTPError as e:
+    code = e.response.status_code if e.response is not None else "?"
+    if code in (401, 403):
+        st.caption("Токен без доступа к «Вопросы и отзывы». Добавьте этот доступ к токену WB, "
+                   "чтобы видеть метрику отзывов.")
+    elif code == 429:
+        st.caption("WB временно лимитирует запрос отзывов (429) — попробуйте позже.")
+    else:
+        st.caption(f"Отзывы недоступны: {e}")
 
 # ---------------------------------------------------------------------------
 # Топ-3 товара по выручке
