@@ -197,7 +197,8 @@ with tabs[3]:
             campaigns = c_ad_campaigns()
             ids = wb.flatten_campaign_ids(campaigns)
             st.write(f"Найдено кампаний: **{len(ids)}**")
-            stats = c_ad_stats(tuple(ids), date_from, wb.today_iso()) if ids else []
+            ad_begin = wb.days_ago_iso(min(days, 31))  # WB v3: период максимум 31 день
+            stats = c_ad_stats(tuple(ids), ad_begin, wb.today_iso()) if ids else []
             if stats:
                 rows = []
                 for s in stats:
@@ -276,5 +277,4 @@ with tabs[5]:
                 st.plotly_chart(px.line(h, x="ts", y="buyout_rate", markers=True,
                                         title="Динамика % выкупа"), use_container_width=True)
             st.dataframe(h, use_container_width=True, height=300)
-
 st.caption("Данные кэшируются на 5 минут. WB ограничивает частоту запросов статистики.")

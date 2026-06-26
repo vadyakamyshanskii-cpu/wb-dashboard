@@ -67,11 +67,15 @@ def get_advert_campaigns() -> dict:
 
 
 def get_advert_fullstats(advert_ids: list, begin: str, end: str) -> list:
-    """Полная статистика по кампаниям за период. Максимум 100 id за запрос."""
+    """Полная статистика по кампаниям за период.
+    Актуальный эндпоинт: GET /adv/v3/fullstats (params: ids, beginDate, endDate).
+    Период максимум 31 день, до 100 кампаний за запрос."""
     if not advert_ids:
         return []
-    body = [{"id": int(i), "interval": {"begin": begin, "end": end}} for i in advert_ids[:100]]
-    r = requests.post(f"{ADV_BASE}/adv/v2/fullstats", headers=_headers(), json=body, timeout=TIMEOUT)
+    params = [("beginDate", begin), ("endDate", end)]
+    for i in advert_ids[:100]:
+        params.append(("ids", int(i)))
+    r = requests.get(f"{ADV_BASE}/adv/v3/fullstats", headers=_headers(), params=params, timeout=TIMEOUT)
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, list) else []
