@@ -14,7 +14,7 @@ import plotly.io as pio
 
 import wb_api as wb
 
-st.set_page_config(page_title="WB Дашборд", page_icon="📦", layout="wide",
+st.set_page_config(page_title="Дашборд Sundays Sport", page_icon="📦", layout="wide",
                    initial_sidebar_state="expanded")
 
 # ---------------------------------------------------------------------------
@@ -185,12 +185,17 @@ def c_feedbacks(since_iso):
     return wb.get_feedbacks(since_iso)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def c_report(date_from, date_to):
+    return wb.get_report(date_from, date_to)
+
+
 # ---------------------------------------------------------------------------
 # Шапка + проверка токена
 # ---------------------------------------------------------------------------
 st.markdown(
     '<div class="hero"><span style="font-size:30px">📦</span>'
-    '<h1 style="margin:0">Дашборд Wildberries</h1>'
+    '<h1 style="margin:0">Дашборд Sundays Sport</h1>'
     '<span class="badge">PREMIUM</span></div>',
     unsafe_allow_html=True,
 )
@@ -590,6 +595,61 @@ with tabs[5]:
                                 title="Динамика % выкупа",
                                 color_discrete_sequence=[ACCENT])), use_container_width=True)
             st.dataframe(h, use_container_width=True, height=300)
+
+# ---------------------------------------------------------------------------
+# Штрафы и компенсации (из отчёта о реализации) — в самом низу
+# ---------------------------------------------------------------------------
+st.divider()
+st.markdown("### 💸 Штрафы и компенсации")
+st.caption("Из финансового отчёта о реализации WB за выбранный период. "
+           "Штраф — удержание WB (например: брак при приёмке, неверная/отсутствующая маркировка, "
+           "подмена вложения, нарушение упаковки). Компенсация/доплата — выплаты в вашу пользу "
+           "(например: компенсация за подмену или утерю, логистические корректировки). "
+           "В колонке «За что» — обоснование из отчёта WB.")
+try:
+    repdf = c_report(start_d.isoformat(), end_d.isoformat())
+    if repdf is None or repdf.empty:
+        st.info("За выбранный период данных нет — отчёт о реализации формируется по закрытым "
+                "неделям (обычно по понедельникам). Выберите более ранний/широкий период.")
+    else:
+        for cc_ in ("penalty", "additional_payment"):
+            if cc_ not in repdf.columns:
+                repdf[cc_] = 0
+        repdf["penalty"] = pd.to_numeric(repdf["penalty"], errors="coerce").fillna(0)
+        repdf["additional_payment"] = pd.to_numeric(repdf["additional_payment"], errors="coerce").fillna(0)
+        pen = float(repdf["penalty"].sum())
+        comp = float(repdf["additional_payment"].sum())
+        fcols = st.columns(2)
+        fcols[0].metric("Штрафы, ₽", fmt(pen))
+        fcols[1].metric("Компенсации / доплаты, ₽", fmt(comp))
+
+        rcol = "bonus_type_name" if "bonus_type_name" in repdf.columns else None
+        if rcol:
+            repdf[rcol] = repdf[rcol].replace("", pd.NA)
+            if "supplier_oper_name" in repdf.columns:
+                repdf[rcol] = repdf[rcol].fillna(repdf["supplier_oper_name"])
+            repdf[rcol] = repdf[rcol].fillna("—")
+            grp = (repdf.groupby(rcol)
+                   .agg(Штраф=("penalty", "sum"), Доплата=("additional_payment", "sum"))
+                   .reset_index())
+            grp = grp[(grp["Штраф"] != 0) | (grp["Доплата"] != 0)]
+            grp = grp.sort_values("Штраф", ascending=False)
+            grp.columns = ["За что", "Штраф, ₽", "Доплата/компенсация, ₽"]
+            st.markdown("**За что начислено — расшифровка:**")
+            if grp.empty:
+                st.caption("Штрафов и доплат за период нет 🎉")
+            else:
+                st.dataframe(grp, use_container_width=True, hide_index=True, height=320)
+        else:
+            st.caption("В отчёте нет поля обоснования.")
+except requests.HTTPError as e:
+    code = e.response.status_code if e.response is not None else "?"
+    if code == 429:
+        st.info("WB временно лимитирует отчёт о реализации (429, ~1 запрос/мин) — попробуйте позже.")
+    elif code in (401, 403):
+        st.info("Токен без доступа к отчёту о реализации.")
+    else:
+        st.info(f"Отчёт о реализации недоступен: {e}")
 
 st.markdown("<div class='subtle' style='margin-top:1rem'>Данные кэшируются на 5 минут. "
             "WB ограничивает частоту запросов статистики.</div>", unsafe_allow_html=True)

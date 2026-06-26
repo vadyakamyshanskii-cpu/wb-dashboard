@@ -290,3 +290,30 @@ def classify_feedbacks(df, a, b) -> dict:
         "bad": int((val <= 3).sum()),
         "avg": float(val.mean()) if val.notna().any() else 0.0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Финансовый отчёт о реализации (штрафы, доплаты/компенсации, обоснование)
+# ---------------------------------------------------------------------------
+def get_report(date_from: str, date_to: str, max_pages: int = 10) -> pd.DataFrame:
+    """Детальный отчёт о реализации за период (reportDetailByPeriod, v5).
+    Содержит penalty (штраф), additional_payment (доплата/компенсация),
+    bonus_type_name (обоснование — «за что»). Постранично по rrd_id."""
+    rows = []
+    rrdid = 0
+    for _ in range(max_pages):
+        r = requests.get(
+            STAT_BASE + "/api/v5/supplier/reportDetailByPeriod",
+            headers=_headers(),
+            params={"dateFrom": date_from, "dateTo": date_to, "limit": 100000, "rrdid": rrdid},
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            break
+        rows.extend(data)
+        rrdid = data[-1].get("rrd_id", 0)
+        if len(data) < 100000 or not rrdid:
+            break
+    return pd.DataFrame(rows)
