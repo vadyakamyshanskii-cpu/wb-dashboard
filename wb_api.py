@@ -1,0 +1,219 @@
+"""
+Клиент WB API + помощники для PostgreSQL.
+Используется и веб-дашбордом (app.py), и cron-скриптом (snapshot.py).
+
+Переменные окружения:
+  WB_TOKEN      — токен Wildberries (категории «Статистика», для рекламы — «Продвижение»).
+  DATABASE_URL  — строка подключения PostgreSQL (Railway проставляет сам).
+"""
+
+import os
+import datetime as dt
+
+import pandas as pd
+import requests
+
+STAT_BASE = "https://statistics-api.wildberries.ru"
+ADV_BASE = "https://advert-api.wildberries.ru"
+TIMEOUT = 60
+
+
+# ---------------------------------------------------------------------------
+# Аутентификация
+# ---------------------------------------------------------------------------
+def token() -> str:
+    return (os.environ.get("WB_TOKEN") or "").strip()
+
+
+def _headers() -> dict:
+    return {"Authorization": token()}
+
+
+# ---------------------------------------------------------------------------
+# Statistics API
+# ---------------------------------------------------------------------------
+def _stat_get(endpoint: str, date_from: str, flag: int = 0) -> pd.DataFrame:
+    r = requests.get(
+        f"{STAT_BASE}{endpoint}",
+        headers=_headers(),
+        params={"dateFrom": date_from, "flag": flag},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return pd.DataFrame(data if isinstance(data, list) else [])
+
+
+def get_orders(date_from: str) -> pd.DataFrame:
+    return _stat_get("/api/v1/supplier/orders", date_from)
+
+
+def get_sales(date_from: str) -> pd.DataFrame:
+    return _stat_get("/api/v1/supplier/sales", date_from)
+
+
+def get_stocks(date_from: str) -> pd.DataFrame:
+    return _stat_get("/api/v1/supplier/stocks", date_from)
+
+
+# ---------------------------------------------------------------------------
+# Advertising API (нужен токен с доступом «Продвижение»)
+# ---------------------------------------------------------------------------
+def get_advert_campaigns() -> dict:
+    """Список рекламных кампаний, сгруппированный по типам/статусам."""
+    r = requests.get(f"{ADV_BASE}/adv/v1/promotion/count", headers=_headers(), timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_advert_fullstats(advert_ids: list, begin: str, end: str) -> list:
+    """Полная статистика по кампаниям за период. Максимум 100 id за запрос."""
+    if not advert_ids:
+        return []
+    body = [{"id": int(i), "interval": {"begin": begin, "end": end}} for i in advert_ids[:100]]
+    r = requests.post(f"{ADV_BASE}/adv/v2/fullstats", headers=_headers(), json=body, timeout=TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
+def flatten_campaign_ids(campaigns: dict) -> list:
+    """Достаёт все advertId из ответа /adv/v1/promotion/count."""
+    ids = []
+    for group in (campaigns or {}).get("adverts", []) or []:
+        for adv in group.get("advert_list", []) or []:
+            if adv.get("advertId"):
+                ids.append(adv["advertId"])
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Производные метрики
+# ---------------------------------------------------------------------------
+def order_amount_col(df: pd.DataFrame) -> str:
+    """Колонка с фактической ценой заказа (со скидкой)."""
+    for c in ("priceWithDisc", "finishedPrice", "totalPrice"):
+        if c in df.columns:
+            return c
+    return ""
+
+
+def split_sales(sales: pd.DataFrame):
+    """Делит записи sales на выкупы (S...) и возвраты (R...) по saleID."""
+    if sales.empty or "saleID" not in sales.columns:
+        return sales, sales.iloc[0:0]
+    is_return = sales["saleID"].astype(str).str.startswith("R")
+    return sales[~is_return], sales[is_return]
+
+
+def compute_kpis(orders: pd.DataFrame, sales: pd.DataFrame) -> dict:
+    """Сводные показатели за период."""
+    buyouts, returns = split_sales(sales)
+
+    o_amt = order_amount_col(orders)
+    orders_cnt = int(len(orders))
+    orders_sum = float(orders[o_amt].sum()) if o_amt else 0.0
+
+    cancels_cnt = int(orders["isCancel"].sum()) if "isCancel" in orders.columns else 0
+
+    buyouts_cnt = int(len(buyouts))
+    buyouts_sum = float(buyouts["forPay"].sum()) if "forPay" in buyouts.columns else 0.0
+    returns_cnt = int(len(returns))
+
+    buyout_rate = (buyouts_cnt / orders_cnt * 100.0) if orders_cnt else 0.0
+    avg_check = (orders_sum / orders_cnt) if orders_cnt else 0.0
+
+    return {
+        "orders_cnt": orders_cnt,
+        "orders_sum": orders_sum,
+        "buyouts_cnt": buyouts_cnt,
+        "buyouts_sum": buyouts_sum,
+        "returns_cnt": returns_cnt,
+        "cancels_cnt": cancels_cnt,
+        "buyout_rate": buyout_rate,
+        "avg_check": avg_check,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL
+# ---------------------------------------------------------------------------
+def db_engine():
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        return None
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    from sqlalchemy import create_engine
+    return create_engine(url, pool_pre_ping=True)
+
+
+def ensure_schema(engine):
+    if engine is None:
+        return
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(
+            """
+            CREATE TABLE IF NOT EXISTS wb_snapshots (
+                id SERIAL PRIMARY KEY,
+                ts TIMESTAMP DEFAULT NOW(),
+                period_days INT,
+                orders_cnt INT,
+                orders_sum NUMERIC,
+                sales_cnt INT,
+                sales_sum NUMERIC
+            )
+            """
+        ))
+        # доращиваем недостающие колонки (на случай старой версии таблицы)
+        for col, typ in [
+            ("period_days", "INT"),
+            ("buyouts_cnt", "INT"),
+            ("buyouts_sum", "NUMERIC"),
+            ("returns_cnt", "INT"),
+            ("cancels_cnt", "INT"),
+            ("buyout_rate", "NUMERIC"),
+            ("avg_check", "NUMERIC"),
+            ("ad_spend", "NUMERIC"),
+        ]:
+            conn.execute(text(
+                f"ALTER TABLE wb_snapshots ADD COLUMN IF NOT EXISTS {col} {typ}"
+            ))
+
+
+def save_snapshot(engine, kpis: dict, period_days: int, ad_spend=None):
+    if engine is None:
+        return
+    ensure_schema(engine)
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text(
+            """
+            INSERT INTO wb_snapshots
+                (period_days, orders_cnt, orders_sum, sales_cnt, sales_sum,
+                 buyouts_cnt, buyouts_sum, returns_cnt, cancels_cnt,
+                 buyout_rate, avg_check, ad_spend)
+            VALUES
+                (:period_days, :orders_cnt, :orders_sum, :buyouts_cnt, :buyouts_sum,
+                 :buyouts_cnt, :buyouts_sum, :returns_cnt, :cancels_cnt,
+                 :buyout_rate, :avg_check, :ad_spend)
+            """
+        ), {**kpis, "period_days": period_days, "ad_spend": ad_spend})
+
+
+def load_history(engine) -> pd.DataFrame:
+    if engine is None:
+        return pd.DataFrame()
+    try:
+        return pd.read_sql("SELECT * FROM wb_snapshots ORDER BY ts", engine)
+    except Exception:
+        return pd.DataFrame()
+
+
+def today_iso() -> str:
+    return dt.date.today().isoformat()
+
+
+def days_ago_iso(days: int) -> str:
+    return (dt.date.today() - dt.timedelta(days=days)).isoformat()

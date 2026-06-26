@@ -1,14 +1,8 @@
 """
-Дашборд Wildberries (FBO/FBS) на Streamlit.
-Тянет данные из WB Statistics API (заказы, продажи, остатки),
-показывает KPI и графики, опционально кэширует историю в PostgreSQL.
-
-Переменные окружения:
-  WB_TOKEN      — API-токен Wildberries (категория "Статистика"). ОБЯЗАТЕЛЬНО.
-  DATABASE_URL  — строка подключения PostgreSQL (Railway проставляет сам). Необязательно.
+Дашборд Wildberries на Streamlit.
+Заказы, выкупы, возвраты, реклама, остатки, динамика и история (PostgreSQL).
 """
 
-import os
 import datetime as dt
 
 import pandas as pd
@@ -16,229 +10,271 @@ import requests
 import streamlit as st
 import plotly.express as px
 
-WB_BASE = "https://statistics-api.wildberries.ru"
-TIMEOUT = 60
+import wb_api as wb
 
 st.set_page_config(page_title="WB Дашборд", page_icon="📦", layout="wide")
 
 
-# ----------------------------------------------------------------------------
-# WB API
-# ----------------------------------------------------------------------------
-def _token() -> str:
-    return (os.environ.get("WB_TOKEN") or "").strip()
+def fmt(n, suffix=""):
+    return f"{n:,.0f}".replace(",", " ") + suffix
 
 
-def _headers() -> dict:
-    return {"Authorization": _token()}
+# ---- кэшированные обёртки (у WB строгий лимит частоты запросов) -------------
+@st.cache_data(ttl=300, show_spinner=False)
+def c_orders(date_from):
+    return wb.get_orders(date_from)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def wb_get(endpoint: str, date_from: str, flag: int = 0) -> pd.DataFrame:
-    """Запрос к WB Statistics API. Кэш 5 минут (у WB строгий лимит ~1 запрос/мин)."""
-    url = f"{WB_BASE}{endpoint}"
-    params = {"dateFrom": date_from, "flag": flag}
-    r = requests.get(url, headers=_headers(), params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list):
-        return pd.DataFrame()
-    return pd.DataFrame(data)
+def c_sales(date_from):
+    return wb.get_sales(date_from)
 
 
-def get_orders(date_from: str) -> pd.DataFrame:
-    return wb_get("/api/v1/supplier/orders", date_from)
+@st.cache_data(ttl=300, show_spinner=False)
+def c_stocks(date_from):
+    return wb.get_stocks(date_from)
 
 
-def get_sales(date_from: str) -> pd.DataFrame:
-    return wb_get("/api/v1/supplier/sales", date_from)
+@st.cache_data(ttl=1800, show_spinner=False)
+def c_ad_campaigns():
+    return wb.get_advert_campaigns()
 
 
-def get_stocks(date_from: str) -> pd.DataFrame:
-    return wb_get("/api/v1/supplier/stocks", date_from)
+@st.cache_data(ttl=1800, show_spinner=False)
+def c_ad_stats(ids, begin, end):
+    return wb.get_advert_fullstats(list(ids), begin, end)
 
 
-# ----------------------------------------------------------------------------
-# PostgreSQL (опционально)
-# ----------------------------------------------------------------------------
-def db_engine():
-    url = os.environ.get("DATABASE_URL", "")
-    if not url:
-        return None
-    # SQLAlchemy ждёт postgresql:// вместо postgres://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
-    try:
-        from sqlalchemy import create_engine
-        return create_engine(url, pool_pre_ping=True)
-    except Exception as e:  # noqa: BLE001
-        st.sidebar.warning(f"PostgreSQL недоступен: {e}")
-        return None
-
-
-def save_snapshot(engine, orders_cnt: int, orders_sum: float, sales_cnt: int, sales_sum: float):
-    if engine is None:
-        return
-    try:
-        from sqlalchemy import text
-        with engine.begin() as conn:
-            conn.execute(text(
-                """
-                CREATE TABLE IF NOT EXISTS wb_snapshots (
-                    id SERIAL PRIMARY KEY,
-                    ts TIMESTAMP DEFAULT NOW(),
-                    orders_cnt INT,
-                    orders_sum NUMERIC,
-                    sales_cnt INT,
-                    sales_sum NUMERIC
-                )
-                """
-            ))
-            conn.execute(text(
-                "INSERT INTO wb_snapshots (orders_cnt, orders_sum, sales_cnt, sales_sum) "
-                "VALUES (:oc, :os, :sc, :ss)"
-            ), {"oc": orders_cnt, "os": orders_sum, "sc": sales_cnt, "ss": sales_sum})
-    except Exception as e:  # noqa: BLE001
-        st.sidebar.warning(f"Не записал снапшот в БД: {e}")
-
-
-def load_history(engine) -> pd.DataFrame:
-    if engine is None:
-        return pd.DataFrame()
-    try:
-        return pd.read_sql("SELECT * FROM wb_snapshots ORDER BY ts", engine)
-    except Exception:
-        return pd.DataFrame()
-
-
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
+# ---- проверка токена -------------------------------------------------------
 st.title("📦 Дашборд Wildberries")
 
-if not _token():
+if not wb.token():
     st.error(
         "Не задан **WB_TOKEN**. В Railway: проект → сервис → вкладка **Variables** → "
-        "добавьте переменную `WB_TOKEN` со значением токена WB (категория «Статистика»)."
+        "добавьте `WB_TOKEN` со значением токена WB (категория «Статистика»)."
     )
     st.stop()
 
 with st.sidebar:
     st.header("Настройки")
     days = st.slider("Период, дней назад", 1, 90, 14)
-    date_from = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    date_from = wb.days_ago_iso(days)
     st.caption(f"Данные с {date_from}")
     if st.button("🔄 Обновить (сбросить кэш)"):
         st.cache_data.clear()
         st.rerun()
 
-engine = db_engine()
+engine = wb.db_engine()
 
+# ---- загрузка данных -------------------------------------------------------
 try:
-    orders = get_orders(date_from)
-    sales = get_sales(date_from)
-    stocks = get_stocks(date_from)
+    orders = c_orders(date_from)
+    sales = c_sales(date_from)
+    stocks = c_stocks(date_from)
 except requests.HTTPError as e:
     code = e.response.status_code if e.response is not None else "?"
-    if code == 401:
-        st.error("WB вернул 401 — токен неверный или не той категории. Нужен токен «Статистика».")
-    elif code == 429:
-        st.error("WB вернул 429 — слишком частые запросы. Подождите минуту и обновите.")
-    else:
-        st.error(f"Ошибка запроса к WB API: {e}")
+    msg = {
+        401: "WB вернул 401 — токен неверный или не той категории. Нужен токен «Статистика».",
+        429: "WB вернул 429 — слишком частые запросы. Подождите минуту и обновите.",
+    }.get(code, f"Ошибка запроса к WB API: {e}")
+    st.error(msg)
     st.stop()
 
-# --- KPI ---
-orders_cnt = len(orders)
-orders_sum = float(orders["totalPrice"].sum()) if "totalPrice" in orders else 0.0
-# реальные продажи (выкупы): isCancel == False / forPay
-sales_cnt = len(sales)
-sales_sum = float(sales["forPay"].sum()) if "forPay" in sales else 0.0
+kpis = wb.compute_kpis(orders, sales)
+buyouts, returns = wb.split_sales(sales)
+o_amt = wb.order_amount_col(orders)
 
-save_snapshot(engine, orders_cnt, orders_sum, sales_cnt, sales_sum)
+# снапшот в БД при каждом открытии (история копится)
+try:
+    wb.save_snapshot(engine, kpis, period_days=days)
+except Exception as e:  # noqa: BLE001
+    st.sidebar.warning(f"Снапшот в БД не записан: {e}")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Заказов", f"{orders_cnt:,}".replace(",", " "))
-c2.metric("Сумма заказов, ₽", f"{orders_sum:,.0f}".replace(",", " "))
-c3.metric("Продаж (выкупов)", f"{sales_cnt:,}".replace(",", " "))
-c4.metric("К перечислению, ₽", f"{sales_sum:,.0f}".replace(",", " "))
+# ---- KPI -------------------------------------------------------------------
+r1 = st.columns(4)
+r1[0].metric("Заказов", fmt(kpis["orders_cnt"]))
+r1[1].metric("Сумма заказов, ₽", fmt(kpis["orders_sum"]))
+r1[2].metric("Выкупов", fmt(kpis["buyouts_cnt"]))
+r1[3].metric("К перечислению, ₽", fmt(kpis["buyouts_sum"]))
 
-tab_o, tab_s, tab_st, tab_h = st.tabs(["Заказы", "Продажи", "Остатки", "История"])
+r2 = st.columns(4)
+r2[0].metric("% выкупа", fmt(kpis["buyout_rate"], " %"))
+r2[1].metric("Средний чек, ₽", fmt(kpis["avg_check"]))
+r2[2].metric("Отмен", fmt(kpis["cancels_cnt"]))
+r2[3].metric("Возвратов", fmt(kpis["returns_cnt"]))
 
-# --- Заказы ---
-with tab_o:
+tabs = st.tabs(["Обзор", "Заказы", "Выкупы и возвраты", "Реклама", "Остатки", "История"])
+
+# ===========================================================================
+# Обзор — динамика
+# ===========================================================================
+with tabs[0]:
     if orders.empty:
         st.info("Заказов за период нет.")
     else:
         o = orders.copy()
         o["date"] = pd.to_datetime(o["date"]).dt.date
-        by_day = o.groupby("date").agg(
-            заказов=("totalPrice", "size"),
-            сумма=("totalPrice", "sum"),
-        ).reset_index()
+        od = o.groupby("date").agg(заказов=(o_amt, "size"), сумма=(o_amt, "sum")).reset_index()
+
+        if not sales.empty:
+            s = buyouts.copy()
+            s["date"] = pd.to_datetime(s["date"]).dt.date
+            sd = s.groupby("date")["forPay"].sum().reset_index().rename(columns={"forPay": "выкуплено"})
+            merged = od.merge(sd, on="date", how="left").fillna(0)
+        else:
+            merged = od.assign(выкуплено=0)
+
         st.plotly_chart(
-            px.bar(by_day, x="date", y="сумма", title="Сумма заказов по дням, ₽"),
+            px.line(merged, x="date", y=["сумма", "выкуплено"], markers=True,
+                    title="Динамика: заказы vs выкупы, ₽",
+                    labels={"value": "₽", "variable": "показатель", "date": "дата"}),
             use_container_width=True,
         )
-        if "subject" in o:
-            top = o.groupby("subject")["totalPrice"].sum().sort_values(ascending=False).head(15).reset_index()
-            st.plotly_chart(
-                px.bar(top, x="totalPrice", y="subject", orientation="h", title="Топ категорий по сумме, ₽"),
-                use_container_width=True,
-            )
-        st.dataframe(o, use_container_width=True, height=300)
+        st.plotly_chart(
+            px.bar(od, x="date", y="заказов", title="Количество заказов по дням",
+                   labels={"заказов": "шт", "date": "дата"}),
+            use_container_width=True,
+        )
 
-# --- Продажи ---
-with tab_s:
+# ===========================================================================
+# Заказы
+# ===========================================================================
+with tabs[1]:
+    if orders.empty:
+        st.info("Заказов за период нет.")
+    else:
+        o = orders.copy()
+        c1, c2 = st.columns(2)
+        if "subject" in o:
+            top = o.groupby("subject")[o_amt].sum().sort_values(ascending=False).head(15).reset_index()
+            c1.plotly_chart(px.bar(top, x=o_amt, y="subject", orientation="h",
+                                   title="Топ категорий по сумме, ₽"), use_container_width=True)
+        if "brand" in o:
+            tb = o.groupby("brand")[o_amt].sum().sort_values(ascending=False).head(15).reset_index()
+            c2.plotly_chart(px.bar(tb, x=o_amt, y="brand", orientation="h",
+                                   title="Топ брендов по сумме, ₽"), use_container_width=True)
+        region_col = "oblastOkrugName" if "oblastOkrugName" in o else (
+            "regionName" if "regionName" in o else None)
+        if region_col:
+            reg = o.groupby(region_col)[o_amt].sum().sort_values(ascending=False).head(15).reset_index()
+            st.plotly_chart(px.bar(reg, x=o_amt, y=region_col, orientation="h",
+                                   title="География заказов по сумме, ₽"), use_container_width=True)
+        st.dataframe(o, use_container_width=True, height=320)
+
+# ===========================================================================
+# Выкупы и возвраты
+# ===========================================================================
+with tabs[2]:
     if sales.empty:
         st.info("Продаж за период нет.")
     else:
-        s = sales.copy()
-        s["date"] = pd.to_datetime(s["date"]).dt.date
-        by_day = s.groupby("date")["forPay"].sum().reset_index()
-        st.plotly_chart(
-            px.line(by_day, x="date", y="forPay", markers=True, title="К перечислению по дням, ₽"),
-            use_container_width=True,
-        )
-        if "warehouseName" in s:
-            wh = s.groupby("warehouseName")["forPay"].sum().sort_values(ascending=False).head(15).reset_index()
-            st.plotly_chart(
-                px.bar(wh, x="forPay", y="warehouseName", orientation="h", title="По складам, ₽"),
-                use_container_width=True,
-            )
-        st.dataframe(s, use_container_width=True, height=300)
+        c1, c2 = st.columns(2)
+        c1.metric("Сумма выкупов, ₽", fmt(kpis["buyouts_sum"]))
+        ret_sum = float(returns["forPay"].sum()) if ("forPay" in returns and not returns.empty) else 0.0
+        c2.metric("Сумма возвратов, ₽", fmt(abs(ret_sum)))
 
-# --- Остатки ---
-with tab_st:
+        b = buyouts.copy()
+        if not b.empty:
+            b["date"] = pd.to_datetime(b["date"]).dt.date
+            bd = b.groupby("date")["forPay"].sum().reset_index()
+            st.plotly_chart(px.area(bd, x="date", y="forPay", title="Выкупы по дням (к перечислению), ₽",
+                                    labels={"forPay": "₽", "date": "дата"}), use_container_width=True)
+            if "warehouseName" in b:
+                wh = b.groupby("warehouseName")["forPay"].sum().sort_values(ascending=False).head(15).reset_index()
+                st.plotly_chart(px.bar(wh, x="forPay", y="warehouseName", orientation="h",
+                                       title="Выкупы по складам, ₽"), use_container_width=True)
+        st.dataframe(sales, use_container_width=True, height=320)
+
+# ===========================================================================
+# Реклама (требует токен с доступом «Продвижение»)
+# ===========================================================================
+with tabs[3]:
+    st.caption("Данные рекламы тянутся отдельно (лимит WB). Нажмите кнопку, чтобы загрузить.")
+    if st.button("📈 Загрузить данные рекламы"):
+        st.session_state["load_ads"] = True
+    if st.session_state.get("load_ads"):
+        try:
+            campaigns = c_ad_campaigns()
+            ids = wb.flatten_campaign_ids(campaigns)
+            st.write(f"Найдено кампаний: **{len(ids)}**")
+            stats = c_ad_stats(tuple(ids), date_from, wb.today_iso()) if ids else []
+            if stats:
+                rows = []
+                for s in stats:
+                    rows.append({
+                        "Кампания": s.get("advertId"),
+                        "Показы": s.get("views", 0),
+                        "Клики": s.get("clicks", 0),
+                        "CTR, %": round(s.get("ctr", 0), 2),
+                        "CPC, ₽": round(s.get("cpc", 0), 2),
+                        "Расход, ₽": round(s.get("sum", 0), 2),
+                        "Заказы": s.get("orders", 0),
+                        "Сумма заказов, ₽": round(s.get("sum_price", 0), 2),
+                    })
+                ad = pd.DataFrame(rows)
+                spend = ad["Расход, ₽"].sum()
+                revenue = ad["Сумма заказов, ₽"].sum()
+                drr = (spend / revenue * 100.0) if revenue else 0.0
+                k = st.columns(4)
+                k[0].metric("Расход на рекламу, ₽", fmt(spend))
+                k[1].metric("Показы", fmt(ad["Показы"].sum()))
+                k[2].metric("Клики", fmt(ad["Клики"].sum()))
+                k[3].metric("ДРР, %", fmt(drr, " %"))
+                st.dataframe(ad, use_container_width=True, height=320)
+            else:
+                st.info("Активных кампаний со статистикой за период не найдено.")
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            if code in (401, 403):
+                st.warning("Токен без доступа к рекламе. Создайте в WB токен с категорией «Продвижение» "
+                           "и используйте его (или добавьте доступ к текущему).")
+            elif code == 429:
+                st.warning("WB вернул 429 по рекламе — подождите минуту и попробуйте снова.")
+            else:
+                st.error(f"Ошибка рекламного API: {e}")
+
+# ===========================================================================
+# Остатки
+# ===========================================================================
+with tabs[4]:
     if stocks.empty:
         st.info("Данных по остаткам нет.")
     else:
-        st_df = stocks.copy()
-        qty_col = "quantityFull" if "quantityFull" in st_df else "quantity"
-        total_qty = int(st_df[qty_col].sum()) if qty_col in st_df else 0
-        st.metric("Всего единиц на складах", f"{total_qty:,}".replace(",", " "))
-        if "warehouseName" in st_df and qty_col in st_df:
-            wh = st_df.groupby("warehouseName")[qty_col].sum().sort_values(ascending=False).reset_index()
-            st.plotly_chart(
-                px.bar(wh, x=qty_col, y="warehouseName", orientation="h", title="Остатки по складам, шт"),
-                use_container_width=True,
-            )
-        st.dataframe(st_df, use_container_width=True, height=300)
+        sdf = stocks.copy()
+        qty = "quantityFull" if "quantityFull" in sdf else "quantity"
+        c1, c2 = st.columns(2)
+        c1.metric("Всего единиц на складах", fmt(int(sdf[qty].sum())) if qty in sdf else "—")
+        if "inWayToClient" in sdf:
+            c2.metric("В пути к клиенту", fmt(int(sdf["inWayToClient"].sum())))
+        if "warehouseName" in sdf and qty in sdf:
+            wh = sdf.groupby("warehouseName")[qty].sum().sort_values(ascending=False).reset_index()
+            st.plotly_chart(px.bar(wh, x=qty, y="warehouseName", orientation="h",
+                                   title="Остатки по складам, шт"), use_container_width=True)
+        if "subject" in sdf and qty in sdf:
+            sub = sdf.groupby("subject")[qty].sum().sort_values(ascending=False).head(15).reset_index()
+            st.plotly_chart(px.bar(sub, x=qty, y="subject", orientation="h",
+                                   title="Остатки по категориям, шт"), use_container_width=True)
+        st.dataframe(sdf, use_container_width=True, height=320)
 
-# --- История (из PostgreSQL) ---
-with tab_h:
+# ===========================================================================
+# История (PostgreSQL)
+# ===========================================================================
+with tabs[5]:
     if engine is None:
-        st.info("PostgreSQL не подключён — история снапшотов недоступна. "
-                "Добавьте в проект Railway базу PostgreSQL, и переменная DATABASE_URL появится автоматически.")
+        st.info("PostgreSQL не подключён — история недоступна.")
     else:
-        hist = load_history(engine)
+        hist = wb.load_history(engine)
         if hist.empty:
-            st.info("История пока пустая — она копится с каждым открытием дашборда.")
+            st.info("История пока пустая — она копится с каждым открытием дашборда и ежедневным авто-снимком.")
         else:
-            st.plotly_chart(
-                px.line(hist, x="ts", y=["orders_sum", "sales_sum"], title="Динамика снапшотов, ₽"),
-                use_container_width=True,
-            )
-            st.dataframe(hist, use_container_width=True, height=300)
+            h = hist.copy()
+            h["ts"] = pd.to_datetime(h["ts"])
+            st.plotly_chart(px.line(h, x="ts", y=["orders_sum", "sales_sum"], markers=True,
+                                    title="Динамика снимков: заказы vs выкупы, ₽"),
+                            use_container_width=True)
+            if "buyout_rate" in h:
+                st.plotly_chart(px.line(h, x="ts", y="buyout_rate", markers=True,
+                                        title="Динамика % выкупа"), use_container_width=True)
+            st.dataframe(h, use_container_width=True, height=300)
 
 st.caption("Данные кэшируются на 5 минут. WB ограничивает частоту запросов статистики.")
