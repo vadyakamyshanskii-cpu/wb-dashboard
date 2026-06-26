@@ -82,6 +82,18 @@ st.markdown(
         border-radius:999px; font-weight:800; letter-spacing:.4px;
       }
       .subtle { color:#8b93a2; font-size:.86rem; }
+
+      /* Карточки топ-товаров */
+      .prodcard {
+        background: linear-gradient(165deg,#1d2334 0%, #14181f 100%);
+        border:1px solid #2a3242; border-radius:16px; padding:16px 18px;
+        box-shadow:0 6px 22px rgba(0,0,0,.40); height:100%;
+      }
+      .prodcard .prank { color:#D4AF37; font-weight:800; font-size:.82rem; letter-spacing:.5px; }
+      .prodcard .pname { color:#F3F4F6; font-weight:700; font-size:1.02rem; margin:.25rem 0 .15rem;
+        white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .prodcard .pval { color:#F5F5F5; font-weight:800; font-size:1.5rem; }
+      .prodcard .pmeta { color:#9aa2b1; font-size:.84rem; margin-top:.25rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -212,9 +224,23 @@ def in_range(df):
 # ---------------------------------------------------------------------------
 # Загрузка данных
 # ---------------------------------------------------------------------------
+# период сравнения той же длины, заканчивающийся за день до start_d (для одного дня — вчера)
+period_len = (end_d - start_d).days + 1
+prev_end = start_d - dt.timedelta(days=1)
+prev_start = prev_end - dt.timedelta(days=period_len - 1)
+fetch_from = prev_start.isoformat()
+
+
+def _between(df, a, b):
+    if df.empty or "date" not in df.columns:
+        return df
+    d = pd.to_datetime(df["date"]).dt.date
+    return df[(d >= a) & (d <= b)]
+
+
 try:
-    orders = in_range(c_orders(date_from))
-    sales = in_range(c_sales(date_from))
+    raw_orders = c_orders(fetch_from)
+    raw_sales = c_sales(fetch_from)
     stocks = c_stocks(date_from)  # остатки — текущий срез, не фильтруем по дате
 except requests.HTTPError as e:
     code = e.response.status_code if e.response is not None else "?"
@@ -225,7 +251,13 @@ except requests.HTTPError as e:
     st.error(msg)
     st.stop()
 
+orders = _between(raw_orders, start_d, end_d)
+sales = _between(raw_sales, start_d, end_d)
+prev_orders = _between(raw_orders, prev_start, prev_end)
+prev_sales = _between(raw_sales, prev_start, prev_end)
+
 kpis = wb.compute_kpis(orders, sales)
+prev_kpis = wb.compute_kpis(prev_orders, prev_sales)
 buyouts, returns = wb.split_sales(sales)
 o_amt = wb.order_amount_col(orders)
 
@@ -242,17 +274,56 @@ st.write("")
 # ---------------------------------------------------------------------------
 # KPI
 # ---------------------------------------------------------------------------
+def dpct(cur, prev):
+    """Прирост в % относительно периода сравнения; None если базы нет."""
+    if not prev or pd.isna(prev):
+        return None
+    return f"{(cur - prev) / prev * 100:+.1f}%"
+
+
+cmp_note = "ко вчера" if one_day else "к пред. периоду"
+st.markdown(f"<div class='subtle'>Δ рядом с цифрой — изменение <b>{cmp_note}</b></div>",
+            unsafe_allow_html=True)
+
 r1 = st.columns(4)
-r1[0].metric("Заказов, шт", fmt(kpis["orders_cnt"]))
-r1[1].metric("Сумма заказов, ₽", fmt(kpis["orders_sum"]))
-r1[2].metric("Выкупов, шт", fmt(kpis["buyouts_cnt"]))
-r1[3].metric("К перечислению, ₽", fmt(kpis["buyouts_sum"]))
+r1[0].metric("Заказов, шт", fmt(kpis["orders_cnt"]), dpct(kpis["orders_cnt"], prev_kpis["orders_cnt"]))
+r1[1].metric("Сумма заказов, ₽", fmt(kpis["orders_sum"]), dpct(kpis["orders_sum"], prev_kpis["orders_sum"]))
+r1[2].metric("Выкупов, шт", fmt(kpis["buyouts_cnt"]), dpct(kpis["buyouts_cnt"], prev_kpis["buyouts_cnt"]))
+r1[3].metric("К перечислению, ₽", fmt(kpis["buyouts_sum"]), dpct(kpis["buyouts_sum"], prev_kpis["buyouts_sum"]))
 
 r2 = st.columns(4)
-r2[0].metric("% выкупа", fmt(kpis["buyout_rate"], " %"))
-r2[1].metric("Средний чек, ₽", fmt(kpis["avg_check"]))
-r2[2].metric("Отмен, шт", fmt(kpis["cancels_cnt"]))
-r2[3].metric("Возвратов, шт", fmt(kpis["returns_cnt"]))
+r2[0].metric("% выкупа", fmt(kpis["buyout_rate"], " %"), dpct(kpis["buyout_rate"], prev_kpis["buyout_rate"]))
+r2[1].metric("Средний чек, ₽", fmt(kpis["avg_check"]), dpct(kpis["avg_check"], prev_kpis["avg_check"]))
+r2[2].metric("Отмен, шт", fmt(kpis["cancels_cnt"]), dpct(kpis["cancels_cnt"], prev_kpis["cancels_cnt"]), delta_color="inverse")
+r2[3].metric("Возвратов, шт", fmt(kpis["returns_cnt"]), dpct(kpis["returns_cnt"], prev_kpis["returns_cnt"]), delta_color="inverse")
+
+# ---------------------------------------------------------------------------
+# Топ-3 товара по выручке
+# ---------------------------------------------------------------------------
+st.write("")
+st.markdown("#### 🏆 Топ-3 товара по выручке")
+if orders.empty or not o_amt:
+    st.caption("Нет данных по товарам за выбранный период.")
+else:
+    pcol = "supplierArticle" if "supplierArticle" in orders.columns else (
+        "nmId" if "nmId" in orders.columns else "subject")
+    grp = (orders.groupby(pcol).agg(rev=(o_amt, "sum"), cnt=(o_amt, "size"))
+           .reset_index().sort_values("rev", ascending=False).head(3))
+    total_rev = float(orders[o_amt].sum()) or 1.0
+    medals = ["🥇", "🥈", "🥉"]
+    cards = st.columns(3)
+    for i, (_, row) in enumerate(grp.iterrows()):
+        share = row["rev"] / total_rev * 100.0
+        cards[i].markdown(
+            "<div class='prodcard'>"
+            f"<div class='prank'>{medals[i]} #{i + 1}</div>"
+            f"<div class='pname'>{row[pcol]}</div>"
+            f"<div class='pval'>{fmt(row['rev'])} ₽</div>"
+            f"<div class='pmeta'>{fmt(row['cnt'])} заказов · "
+            f"<b style='color:#D4AF37'>{share:.1f}%</b> выручки</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 tabs = st.tabs(["Обзор", "Заказы", "Выкупы и возвраты", "Реклама", "Остатки", "История"])
 
