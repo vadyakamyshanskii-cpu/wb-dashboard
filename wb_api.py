@@ -69,22 +69,38 @@ def get_advert_campaigns() -> dict:
 def get_advert_fullstats(advert_ids: list, begin: str, end: str) -> list:
     """Полная статистика по кампаниям за период.
     Актуальный эндпоинт: GET /adv/v3/fullstats (params: ids, beginDate, endDate).
-    Период максимум 31 день, до 100 кампаний за запрос."""
+    Период максимум 31 день, до 100 кампаний за запрос.
+    ids передаём одной строкой через запятую — так WB принимает стабильнее.
+    Запрашиваем кампании пачками по 50, проблемные пачки пропускаем."""
     if not advert_ids:
         return []
-    params = [("beginDate", begin), ("endDate", end)]
-    for i in advert_ids[:100]:
-        params.append(("ids", int(i)))
-    r = requests.get(f"{ADV_BASE}/adv/v3/fullstats", headers=_headers(), params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else []
+    out = []
+    ids = [int(i) for i in advert_ids]
+    for k in range(0, min(len(ids), 100), 50):
+        chunk = ids[k:k + 50]
+        params = {"beginDate": begin, "endDate": end, "ids": ",".join(map(str, chunk))}
+        try:
+            r = requests.get(f"{ADV_BASE}/adv/v3/fullstats", headers=_headers(),
+                             params=params, timeout=TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                out.extend(data)
+        except requests.HTTPError as e:
+            # 400 по части кампаний (архивные/без статистики) — пропускаем пачку
+            if e.response is not None and e.response.status_code in (400, 404):
+                continue
+            raise
+    return out
 
 
-def flatten_campaign_ids(campaigns: dict) -> list:
-    """Достаёт все advertId из ответа /adv/v1/promotion/count."""
+def flatten_campaign_ids(campaigns: dict, statuses=(7, 9, 11)) -> list:
+    """Достаёт advertId из ответа /adv/v1/promotion/count.
+    По умолчанию берём кампании со статистикой: 9 (идут показы), 11 (пауза), 7 (завершена)."""
     ids = []
     for group in (campaigns or {}).get("adverts", []) or []:
+        if statuses and group.get("status") not in statuses:
+            continue
         for adv in group.get("advert_list", []) or []:
             if adv.get("advertId"):
                 ids.append(adv["advertId"])
@@ -185,7 +201,6 @@ def ensure_schema(engine):
                 f"ALTER TABLE wb_snapshots ADD COLUMN IF NOT EXISTS {col} {typ}"
             ))
 
-
 def save_snapshot(engine, kpis: dict, period_days: int, ad_spend=None):
     if engine is None:
         return
@@ -206,7 +221,7 @@ def save_snapshot(engine, kpis: dict, period_days: int, ad_spend=None):
         ), {**kpis, "period_days": period_days, "ad_spend": ad_spend})
 
 
-def load_history(engine) -> pd.DataFrame:
+def load_history(engine):
     if engine is None:
         return pd.DataFrame()
     try:
